@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/allegro/bigcache/v3"
 	"github.com/julienschmidt/httprouter"
 	"golang.org/x/exp/slog"
 
@@ -21,11 +23,15 @@ var (
 	password = os.Getenv("ZENDUTY_PASSWORD")
 	port     = os.Getenv("PORT")
 
+	cache *bigcache.BigCache
+
 	//go:embed index.html
 	index string
 )
 
 func run(out io.Writer) error {
+	cache, _ = bigcache.New(context.Background(), bigcache.DefaultConfig(24*time.Hour))
+
 	if len(port) == 0 {
 		port = "3000"
 	}
@@ -78,32 +84,56 @@ func run(out io.Writer) error {
 
 func byAtendeeHandler(teamKey, scheduleKey, memberKey string, getSchedule func(ctx context.Context, teamID string, scheduleID string, months int) (*zenduty.Schedule, error)) httprouter.Handle {
 	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		cacheKey := fmt.Sprintf("/calendar/%s/%s/%s", teamKey, scheduleKey, memberKey)
+		if r.UserAgent() == "Google-Calendar-Importer" {
+			scheduleBytes, err := cache.Get(cacheKey)
+			if err == nil {
+				outputSchedule(w, scheduleBytes)
+				return
+			}
+		}
 		schedule, err := getSchedule(r.Context(), ps.ByName(teamKey), ps.ByName(scheduleKey), 12)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(err.Error()))
 			return
 		}
-		outputSchedule(w, schedule.OnlyAttendees(ps.ByName(memberKey)))
+		scheduleBuffer := new(bytes.Buffer)
+		schedule.OnlyAttendees(ps.ByName(memberKey)).SerializeTo(scheduleBuffer)
+		scheduleBytes, _ := io.ReadAll(scheduleBuffer)
+		cache.Set(cacheKey, scheduleBytes)
+		outputSchedule(w, scheduleBytes)
 	}
 }
 
 func myScheduleHandler(c *zenduty.Client, forUser func(httprouter.Params) string) httprouter.Handle {
 	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		cacheKey := fmt.Sprintf("/myschedule/%s", forUser(ps))
+		if r.UserAgent() == "Google-Calendar-Importer" {
+			scheduleBytes, err := cache.Get(cacheKey)
+			if err == nil {
+				outputSchedule(w, scheduleBytes)
+				return
+			}
+		}
 		schedule, err := c.CombinedSchedule(r.Context(), forUser(ps))
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(err.Error()))
 			return
 		}
-		outputSchedule(w, schedule.OnlyAttendees(forUser(ps)))
+		scheduleBuffer := new(bytes.Buffer)
+		schedule.OnlyAttendees(forUser(ps)).SerializeTo(scheduleBuffer)
+		scheduleBytes, _ := io.ReadAll(scheduleBuffer)
+		cache.Set(cacheKey, scheduleBytes)
+		outputSchedule(w, scheduleBytes)
 	}
 }
 
-func outputSchedule(w http.ResponseWriter, schedule *zenduty.Schedule) {
+func outputSchedule(w http.ResponseWriter, scheduleBytes []byte) {
 	w.Header().Set("content-type", "text/calendar; charset=utf-8")
 	w.Header().Set("cache-control", fmt.Sprintf("max-age=%d, public", 5*60))
-	schedule.SerializeTo(w)
+	io.Copy(w, bytes.NewReader(scheduleBytes))
 }
 
 func withHttpLog(logger *slog.Logger) func(http.Handler) http.Handler {
